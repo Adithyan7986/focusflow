@@ -1,0 +1,91 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FocusFlow</title>
+  <link rel="stylesheet" href="popup.css" />
+</head>
+<body>
+  <main class="app">
+    <header class="header">
+      <div class="logo">F</div>
+      <div>
+        <h1>FocusFlow</h1>
+        <p class="subtitle">Digital Attention Tracker</p>
+      </div>
+      <span id="connectionBadge" class="badge offline">Offline</span>
+    </header>
+
+    <section id="loginSection" class="panel">
+      <h2>Welcome back</h2>
+      <p class="muted">Log in to sync your website activity.</p>
+
+      <form id="loginForm">
+        <label for="email">Email address</label>
+        <input
+          id="email"
+          name="email"
+          type="email"
+          placeholder="you@example.com"
+          autocomplete="username"
+          required
+        />
+
+        <label for="password">Password</label>
+        <input
+          id="password"
+          name="password"
+          type="password"
+          placeholder="Enter your password"
+          autocomplete="current-password"
+          required
+        />
+
+        <button id="loginButton" type="submit">Log in</button>
+      </form>
+    </section>
+
+    <section id="activitySection" class="hidden">
+      <div class="account-row">
+        <div>
+          <p class="muted small">Signed in as</p>
+          <p id="accountEmail" class="account-email">Your account</p>
+        </div>
+        <button id="logoutButton" class="button-secondary" type="button">
+          Log out
+        </button>
+      </div>
+
+      <div class="summary-card">
+        <p class="muted">Today's tracked browsing time</p>
+        <p id="totalTime" class="total-time">0 min</p>
+        <p id="siteCount" class="small muted">0 websites tracked</p>
+      </div>
+
+      <div class="section-heading">
+        <h2>Top websites</h2>
+        <button id="refreshButton" class="text-button" type="button">
+          Refresh
+        </button>
+      </div>
+
+      <div id="activityList" class="activity-list">
+        <p class="empty-state">No activity recorded yet.</p>
+      </div>
+
+      <button id="syncButton" type="button">Sync activity</button>
+      <p id="lastSync" class="muted small"></p>
+    </section>
+
+    <p id="statusMessage" class="status" role="status" aria-live="polite"></p>
+
+    <footer>
+      <p>Focus better. Browse mindfully.</p>
+    </footer>
+  </main>
+
+  <script src="popup.js"></script>
+</body>
+</html>

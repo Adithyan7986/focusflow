@@ -1,0 +1,24 @@
+
+{
+  "manifest_version": 3,
+  "name": "FocusFlow - Attention Tracker",
+  "version": "1.0.0",
+  "description": "Track website usage and improve digital focus.",
+  "permissions": [
+    "tabs",
+    "storage",
+    "idle",
+    "alarms"
+  ],
+  "host_permissions": [
+    "http://127.0.0.1:8000/*",
+    "http://localhost:8000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "FocusFlow",
+    "default_popup": "popup.html"
+  }
+}
