@@ -17,7 +17,16 @@ const DEFAULT_DAILY_GOAL = 120
 
 function toDate(value) {
   if (!value) return null
-  const date = new Date(value)
+
+  // Backend timestamps are UTC but may not include the UTC suffix.
+  const normalizedValue =
+    typeof value === 'string' &&
+    !value.endsWith('Z') &&
+    !/[+-]\d{2}:\d{2}$/.test(value)
+      ? `${value}Z`
+      : value
+
+  const date = new Date(normalizedValue)
   return Number.isNaN(date.getTime()) ? null : date
 }
 

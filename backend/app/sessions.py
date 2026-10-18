@@ -111,6 +111,24 @@ def session_response(session):
     }
 
 
+def calculate_elapsed_seconds(started_at):
+    """Calculate non-negative elapsed seconds from a start timestamp."""
+    return max(
+        0,
+        int((now_utc() - ensure_utc(started_at)).total_seconds()),
+    )
+
+
+def capped_total_seconds(session, additional_seconds=0):
+    """Prevent recorded focus time from exceeding the session goal."""
+    goal_seconds = session["goal_minutes"] * 60
+
+    return min(
+        goal_seconds,
+        max(0, session.get("total_seconds", 0) + additional_seconds),
+    )
+
+
 @router.post("/start")
 def start_session(
     payload: StartSessionRequest,
@@ -153,7 +171,7 @@ def pause_session(
     session_id: str,
     user_id: str = Depends(get_current_user),
 ):
-    """Pause a running focus session and save elapsed time."""
+    """Pause a running session and save elapsed focus time."""
 
     session = sessions_collection.find_one({
         "session_id": session_id,
@@ -167,15 +185,10 @@ def pause_session(
             detail="Running session not found.",
         )
 
-    elapsed = max(
-        0,
-        int(
-            (
-                now_utc()
-                - ensure_utc(session["running_since"])
-            ).total_seconds()
-        ),
-    )
+    elapsed = calculate_elapsed_seconds(session["running_since"])
+    total_seconds = capped_total_seconds(session, elapsed)
+    timestamp = now_utc()
+    completed = total_seconds >= session["goal_minutes"] * 60
 
     sessions_collection.update_one(
         {
@@ -184,11 +197,12 @@ def pause_session(
             "status": "running",
         },
         {
-            "$inc": {"total_seconds": elapsed},
             "$set": {
-                "status": "paused",
+                "total_seconds": total_seconds,
+                "status": "completed" if completed else "paused",
                 "running_since": None,
-            },
+                "ended_at": timestamp if completed else None,
+            }
         },
     )
 
@@ -205,7 +219,7 @@ def resume_session(
     session_id: str,
     user_id: str = Depends(get_current_user),
 ):
-    """Resume a paused focus session."""
+    """Resume a paused session if its goal has not been reached."""
 
     session = sessions_collection.find_one({
         "session_id": session_id,
@@ -219,6 +233,14 @@ def resume_session(
             detail="Paused session not found.",
         )
 
+    if session.get("total_seconds", 0) >= session["goal_minutes"] * 60:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="The session goal has already been reached.",
+        )
+
+    timestamp = now_utc()
+
     sessions_collection.update_one(
         {
             "_id": session["_id"],
@@ -228,7 +250,7 @@ def resume_session(
         {
             "$set": {
                 "status": "running",
-                "running_since": now_utc(),
+                "running_since": timestamp,
             }
         },
     )
@@ -246,7 +268,7 @@ def end_session(
     session_id: str,
     user_id: str = Depends(get_current_user),
 ):
-    """End an active focus session and save its elapsed time."""
+    """End an active session without exceeding its planned duration."""
 
     session = sessions_collection.find_one({
         "session_id": session_id,
@@ -263,15 +285,12 @@ def end_session(
     extra_seconds = 0
 
     if session["status"] == "running":
-        extra_seconds = max(
-            0,
-            int(
-                (
-                    now_utc()
-                    - ensure_utc(session["running_since"])
-                ).total_seconds()
-            ),
+        extra_seconds = calculate_elapsed_seconds(
+            session["running_since"]
         )
+
+    total_seconds = capped_total_seconds(session, extra_seconds)
+    timestamp = now_utc()
 
     sessions_collection.update_one(
         {
@@ -280,12 +299,12 @@ def end_session(
             "status": {"$in": ["running", "paused"]},
         },
         {
-            "$inc": {"total_seconds": extra_seconds},
             "$set": {
+                "total_seconds": total_seconds,
                 "status": "completed",
-                "ended_at": now_utc(),
+                "ended_at": timestamp,
                 "running_since": None,
-            },
+            }
         },
     )
 

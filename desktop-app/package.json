@@ -1,0 +1,37 @@
+
+{
+  "name": "focusflow-desktop",
+  "version": "1.0.0",
+  "description": "FocusFlow AI-Powered Digital Attention Management System",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "build": "npm run copy-frontend && electron-builder --win nsis",
+    "copy-frontend": "xcopy ..\\frontend\\dist frontend-dist /E /I /Y"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "concurrently": "^10.0.6",
+    "electron": "^44.8.0",
+    "electron-builder": "^26.15.3",
+    "wait-on": "^9.5.1"
+  },
+  "build": {
+    "appId": "com.focusflow.desktop",
+    "productName": "FocusFlow",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "package.json",
+      "frontend-dist/**/*"
+    ],
+    "win": {
+      "target": "nsis"
+    }
+  }
+}
