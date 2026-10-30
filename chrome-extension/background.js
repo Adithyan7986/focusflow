@@ -1,209 +1,256 @@
 
-const IDLE_THRESHOLD_SECONDS = 60
-const STORAGE_KEY = 'focusflowActivity'
-const TRACKING_ALARM = 'focusflowTrackingTick'
+const IDLE_THRESHOLD_SECONDS = 60;
+const STORAGE_KEY = "focusflowActivity";
+const METRICS_KEY = "focusflowMetrics";
+const TRACKING_ALARM = "focusflowTrackingTick";
 
-let currentTabId = null
-let currentDomain = null
-let lastStartedAt = null
-let isIdle = false
+let currentTabId = null;
+let currentDomain = null;
+let lastStartedAt = null;
+let isIdle = false;
+let lastActivityDate = null;
 
 function getDomain(url) {
-  if (!url) return null
+  if (!url) return null;
 
   try {
-    const parsed = new URL(url)
-
-    if (!['http:', 'https:'].includes(parsed.protocol)) {
-      return null
-    }
-
-    return parsed.hostname.replace(/^www\./, '')
+    const parsed = new URL(url);
+    if (!["http:", "https:"].includes(parsed.protocol)) return null;
+    return parsed.hostname.replace(/^www\./, "").toLowerCase();
   } catch {
-    return null
+    return null;
   }
 }
 
 function todayKey() {
-  const now = new Date()
-  const year = now.getFullYear()
-  const month = String(now.getMonth() + 1).padStart(2, '0')
-  const day = String(now.getDate()).padStart(2, '0')
-
-  return `${year}-${month}-${day}`
+  const now = new Date();
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
 }
 
-async function getStoredActivity() {
-  const result = await chrome.storage.local.get(STORAGE_KEY)
-  return result[STORAGE_KEY] || {}
+async function getStored(key) {
+  const result = await chrome.storage.local.get(key);
+  return result[key] || {};
 }
 
-async function saveElapsedTime() {
-  if (!currentDomain || lastStartedAt === null || isIdle) {
-    lastStartedAt = null
-    return
+async function updateMetrics(callback) {
+  const metrics = await getStored(METRICS_KEY);
+  const date = todayKey();
+
+  if (!metrics[date]) {
+    metrics[date] = {
+      tab_switches: 0,
+      active_seconds: 0,
+      idle_seconds: 0,
+      last_updated: new Date().toISOString()
+    };
   }
 
-  const elapsedSeconds = Math.max(
+  callback(metrics[date]);
+  metrics[date].last_updated = new Date().toISOString();
+
+  await chrome.storage.local.set({ [METRICS_KEY]: metrics });
+}
+
+async function recordTabSwitch() {
+  await updateMetrics((day) => {
+    day.tab_switches += 1;
+  });
+}
+
+async function recordElapsedTime() {
+  if (lastStartedAt === null) return;
+
+  const elapsed = Math.max(
     0,
-    Math.floor((Date.now() - lastStartedAt) / 1000),
-  )
+    Math.floor((Date.now() - lastStartedAt) / 1000)
+  );
 
-  lastStartedAt = null
+  lastStartedAt = Date.now();
 
-  if (elapsedSeconds === 0) return
+  if (elapsed === 0) return;
 
-  const activity = await getStoredActivity()
-  const date = todayKey()
-
-  if (!activity[date]) {
-    activity[date] = {}
+  if (isIdle) {
+    await updateMetrics((day) => {
+      day.idle_seconds += elapsed;
+    });
+    return;
   }
+
+  await updateMetrics((day) => {
+    day.active_seconds += elapsed;
+  });
+
+  if (!currentDomain) return;
+
+  const activity = await getStored(STORAGE_KEY);
+  const date = todayKey();
+
+  if (!activity[date]) activity[date] = {};
 
   if (!activity[date][currentDomain]) {
     activity[date][currentDomain] = {
       seconds: 0,
-      category: 'uncategorized',
-    }
+      category: "uncategorized"
+    };
   }
 
-  activity[date][currentDomain].seconds += elapsedSeconds
+  activity[date][currentDomain].seconds += elapsed;
 
   await chrome.storage.local.set({
-    [STORAGE_KEY]: activity,
-  })
+    [STORAGE_KEY]: activity
+  });
 }
 
-async function startTracking(tabId, url) {
-  await saveElapsedTime()
+async function startTracking(tabId, url, countSwitch = false) {
+  await recordElapsedTime();
 
-  currentTabId = tabId
-  currentDomain = getDomain(url)
-
-  if (!currentDomain || isIdle) {
-    lastStartedAt = null
-    return
+  if (
+    countSwitch &&
+    currentTabId !== null &&
+    currentTabId !== tabId
+  ) {
+    await recordTabSwitch();
   }
 
-  lastStartedAt = Date.now()
+  currentTabId = tabId;
+  currentDomain = getDomain(url);
+  lastStartedAt = Date.now();
+
+  if (isIdle || !currentDomain) {
+    lastStartedAt = null;
+  }
 }
 
 async function syncActiveTab() {
-  const state = await chrome.idle.queryState(IDLE_THRESHOLD_SECONDS)
-  isIdle = state !== 'active'
+  const state = await chrome.idle.queryState(IDLE_THRESHOLD_SECONDS);
+  isIdle = state !== "active";
 
   if (isIdle) {
-    await saveElapsedTime()
-    currentTabId = null
-    currentDomain = null
-    return
+    await recordElapsedTime();
+    currentTabId = null;
+    currentDomain = null;
+    lastStartedAt = Date.now();
+    return;
   }
 
   const tabs = await chrome.tabs.query({
     active: true,
-    lastFocusedWindow: true,
-  })
+    lastFocusedWindow: true
+  });
 
-  const tab = tabs[0]
+  const tab = tabs[0];
 
   if (tab) {
-    await startTracking(tab.id, tab.url)
+    await startTracking(tab.id, tab.url);
   } else {
-    await saveElapsedTime()
-    currentTabId = null
-    currentDomain = null
+    await recordElapsedTime();
+    currentTabId = null;
+    currentDomain = null;
+    lastStartedAt = null;
   }
 }
 
 chrome.runtime.onInstalled.addListener(async () => {
-  chrome.idle.setDetectionInterval(IDLE_THRESHOLD_SECONDS)
+  chrome.idle.setDetectionInterval(IDLE_THRESHOLD_SECONDS);
 
   await chrome.alarms.create(TRACKING_ALARM, {
-    periodInMinutes: 0.5,
-  })
+    periodInMinutes: 0.5
+  });
 
-  await syncActiveTab()
-})
+  await syncActiveTab();
+});
 
 chrome.runtime.onStartup.addListener(async () => {
-  chrome.idle.setDetectionInterval(IDLE_THRESHOLD_SECONDS)
-  await syncActiveTab()
-})
+  chrome.idle.setDetectionInterval(IDLE_THRESHOLD_SECONDS);
+  await syncActiveTab();
+});
 
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
-  const tab = await chrome.tabs.get(tabId)
-  await startTracking(tabId, tab.url)
-})
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+
+  if (tab) {
+    await startTracking(tabId, tab.url, true);
+  }
+});
 
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
-  if (
-    tab.active &&
-    changeInfo.url
-  ) {
-    await startTracking(tabId, changeInfo.url)
+  if (tab.active && (changeInfo.url || changeInfo.status === "complete")) {
+    await startTracking(tabId, tab.url);
   }
-})
+});
 
 chrome.windows.onFocusChanged.addListener(async (windowId) => {
   if (windowId === chrome.windows.WINDOW_ID_NONE) {
-    await saveElapsedTime()
-    currentTabId = null
-    currentDomain = null
-    return
+    await recordElapsedTime();
+    currentTabId = null;
+    currentDomain = null;
+    lastStartedAt = null;
+    return;
   }
 
-  await syncActiveTab()
-})
+  await syncActiveTab();
+});
 
 chrome.idle.onStateChanged.addListener(async (state) => {
-  isIdle = state !== 'active'
+  await recordElapsedTime();
+
+  isIdle = state !== "active";
 
   if (isIdle) {
-    await saveElapsedTime()
-    currentTabId = null
-    currentDomain = null
+    currentTabId = null;
+    currentDomain = null;
+    lastStartedAt = Date.now();
   } else {
-    await syncActiveTab()
+    await syncActiveTab();
   }
-})
+});
 
 chrome.alarms.onAlarm.addListener(async (alarm) => {
-  if (alarm.name !== TRACKING_ALARM) return
+  if (alarm.name !== TRACKING_ALARM) return;
 
-  if (currentTabId !== null && !isIdle) {
-    const tab = await chrome.tabs.get(currentTabId).catch(() => null)
+  if (currentTabId !== null) {
+    const tab = await chrome.tabs.get(currentTabId).catch(() => null);
 
     if (!tab || !tab.active) {
-      await syncActiveTab()
-      return
+      await syncActiveTab();
+      return;
     }
+  }
 
-    await saveElapsedTime()
+  await recordElapsedTime();
 
-    if (tab.url && getDomain(tab.url)) {
-      currentDomain = getDomain(tab.url)
-      lastStartedAt = Date.now()
-    }
+  if (currentTabId !== null && !isIdle && currentDomain) {
+    lastStartedAt = Date.now();
   } else {
-    await syncActiveTab()
+    await syncActiveTab();
   }
-})
+});
 
-// Popup can request the latest stored activity.
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  if (message?.type === 'GET_ACTIVITY') {
-    getStoredActivity()
-      .then((activity) => sendResponse({ activity }))
-      .catch(() => sendResponse({ activity: {}, error: 'Could not load activity.' }))
+  if (message?.type === "GET_ACTIVITY") {
+    Promise.all([
+      getStored(STORAGE_KEY),
+      getStored(METRICS_KEY)
+    ])
+      .then(([activity, metrics]) => {
+        sendResponse({ activity, metrics });
+      })
+      .catch(() => {
+        sendResponse({
+          activity: {},
+          metrics: {},
+          error: "Could not load tracking data."
+        });
+      });
 
-    return true
+    return true;
   }
 
-  if (message?.type === 'RESET_ACTIVITY') {
-    chrome.storage.local.remove(STORAGE_KEY)
+  if (message?.type === "RESET_ACTIVITY") {
+    chrome.storage.local.remove([STORAGE_KEY, METRICS_KEY])
       .then(() => sendResponse({ success: true }))
-      .catch(() => sendResponse({ success: false }))
+      .catch(() => sendResponse({ success: false }));
 
-    return true
+    return true;
   }
-})
+});

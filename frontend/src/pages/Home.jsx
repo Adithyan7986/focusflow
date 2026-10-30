@@ -1,4 +1,3 @@
-
 import { useCallback, useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import {
@@ -18,7 +17,6 @@ const DEFAULT_DAILY_GOAL = 120
 function toDate(value) {
   if (!value) return null
 
-  // Backend timestamps are UTC but may not include the UTC suffix.
   const normalizedValue =
     typeof value === 'string' &&
     !value.endsWith('Z') &&
@@ -166,6 +164,13 @@ export default function Home() {
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
   const [activeSection, setActiveSection] = useState('#overview')
 
+  // AI prediction states
+  const [mlPredictions, setMlPredictions] = useState(null)
+  const [mlLoading, setMlLoading] = useState(false)
+  const [mlError, setMlError] = useState('')
+  const [trackingMetrics, setTrackingMetrics] = useState(null)
+  const [metricsLoading, setMetricsLoading] = useState(false)
+
   let user = null
 
   try {
@@ -217,6 +222,133 @@ export default function Home() {
 
     return data
   }, [navigate, token])
+
+  // Load the browser metrics automatically collected by the Chrome extension.
+  const loadTrackingMetrics = useCallback(async () => {
+    setMetricsLoading(true)
+    try {
+      const data = await request(`/api/v1/analytics/metrics?date=${localDateKey()}`)
+      setTrackingMetrics(data)
+      return data
+    } finally {
+      setMetricsLoading(false)
+    }
+  }, [request])
+
+  // Build prediction features from actual FocusFlow records and extension metrics.
+  // Some model features are not collected by this extension; those are sent as
+  // neutral defaults and explicitly identified in the result note.
+  const loadMLPredictions = async () => {
+    setMlLoading(true)
+    setMlError('')
+
+    try {
+      const metrics = await loadTrackingMetrics()
+      const latestCompleted = allSessions.find((item) => item.status === 'completed')
+      const sourceSession = session || latestCompleted
+
+      if (!sourceSession) {
+        throw new Error('Start or complete a focus session before generating predictions.')
+      }
+
+      const sessionDurationMinutes = Math.max(0, getDuration(sourceSession) / 60)
+      const currentHour = new Date().getHours()
+      const timeOfDay = currentHour < 12 ? 'morning' : currentHour < 17 ? 'afternoon' : 'evening'
+      const categorySeconds = websiteActivity.reduce((totals, item) => {
+        const category = item.category || 'uncategorized'
+        totals[category] = (totals[category] || 0) + (Number(item.seconds) || 0)
+        return totals
+      }, {})
+      const websiteCategory = Object.entries(categorySeconds)
+        .sort((a, b) => b[1] - a[1])[0]?.[0] || 'uncategorized'
+      const recentCompleted = allSessions
+        .filter((item) => item.status === 'completed')
+        .slice(0, 5)
+      const previousFocusScore = recentCompleted.length
+        ? Math.min(100, Math.round(
+            recentCompleted.reduce((sum, item) => {
+              const planned = Math.max(1, Number(item.goal_minutes) || 25) * 60
+              return sum + Math.min(1, getDuration(item) / planned) * 100
+            }, 0) / recentCompleted.length,
+          ))
+        : 0
+
+      const activeMinutes = Math.max(1, (Number(metrics?.active_seconds) || 0) / 60)
+      const todayPausedSessions = allSessions.filter((item) => {
+        const date = toDate(item.created_at || item.started_at)
+        return date && sameDay(date, new Date()) && item.status === 'paused'
+      }).length
+
+      const payload = {
+        session_duration_min: Number(sessionDurationMinutes.toFixed(2)),
+        website_category: websiteCategory,
+        current_app: 'Chrome',
+        tab_switches_per_min: (Number(metrics?.tab_switches) || 0) / activeMinutes,
+        mouse_clicks_per_min: 0,
+        keystrokes_per_min: 0,
+        idle_time_min: Number(((Number(metrics?.idle_seconds) || 0) / 60).toFixed(2)),
+        time_of_day: timeOfDay,
+        notifications_received: 0,
+        breaks_taken: todayPausedSessions,
+        task_goal_match_score: Math.min(1, Math.max(0, focusMinutes / Math.max(1, dailyGoal))),
+        previous_focus_score: previousFocusScore,
+        sleep_hours_previous_night: 0,
+      }
+
+      const data = await request('/api/v1/analytics/predictions', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      })
+
+      // Calculate distraction from collected behaviour, rather than trusting
+      // the synthetic-data model's distraction label.
+      const todayKey = localDateKey()
+      const todaySites = websiteActivity.filter((item) => item.date === todayKey)
+      const trackedWebsiteSeconds = todaySites.reduce(
+        (sum, item) => sum + (Number(item.seconds) || 0), 0,
+      )
+      const distractingWebsiteSeconds = todaySites.reduce(
+        (sum, item) => sum + (item.category === 'distracting' ? (Number(item.seconds) || 0) : 0),
+        0,
+      )
+      const tabSwitchRate = (Number(metrics?.tab_switches) || 0) / activeMinutes
+      const idleSeconds = Number(metrics?.idle_seconds) || 0
+      const activeSeconds = Number(metrics?.active_seconds) || 0
+      const idlePercent = idleSeconds + activeSeconds > 0
+        ? (idleSeconds / (idleSeconds + activeSeconds)) * 100
+        : 0
+      // Normalize each signal to 0–100. More than 2 switches/min reaches the
+      // maximum tab-switch component; website component uses extension labels.
+      const tabSwitchComponent = Math.min(100, (tabSwitchRate / 2) * 100)
+      const distractingWebsitePercent = trackedWebsiteSeconds > 0
+        ? (distractingWebsiteSeconds / trackedWebsiteSeconds) * 100
+        : null
+      const availableWeights = distractingWebsitePercent === null
+        ? { tab: 0.7, idle: 0.3 }
+        : { tab: 0.4, idle: 0.3, website: 0.3 }
+      const distractionScore = Math.round(
+        tabSwitchComponent * availableWeights.tab
+        + Math.min(100, idlePercent) * availableWeights.idle
+        + (distractingWebsitePercent === null ? 0 : distractingWebsitePercent * availableWeights.website),
+      )
+      const distractionLabel = distractionScore < 30
+        ? 'Low Distraction'
+        : distractionScore < 60
+          ? 'Moderate Distraction'
+          : 'High Distraction'
+
+      setMlPredictions({
+        ...data.predictions,
+        distraction_analysis: distractionLabel,
+        distraction_score: distractionScore,
+        distraction_data_available: trackedWebsiteSeconds > 0,
+      })
+    } catch (err) {
+      setMlError(err.message || 'Could not generate predictions.')
+    } finally {
+      setMlLoading(false)
+    }
+  }
 
   const loadProfile = useCallback(async () => {
     const profile = await request('/api/profile')
@@ -312,6 +444,7 @@ export default function Home() {
 
         if (!cancelled) {
           await loadWebsiteActivity()
+          await loadTrackingMetrics()
         }
       } catch (err) {
         if (!cancelled) {
@@ -335,6 +468,7 @@ export default function Home() {
     loadProfile,
     loadSessions,
     loadWebsiteActivity,
+    loadTrackingMetrics,
   ])
 
   useEffect(() => {
@@ -572,6 +706,7 @@ export default function Home() {
       await loadProfile()
       await loadSessions()
       await loadWebsiteActivity()
+      await loadTrackingMetrics()
     } catch (err) {
       setError(err.message)
     } finally {
@@ -612,8 +747,7 @@ export default function Home() {
       icon: <History size={18} />,
     },
   ]
-
-  return (
+    return (
     <div className="min-h-screen bg-slate-50 text-slate-900">
       {mobileNavOpen && (
         <button
@@ -648,9 +782,9 @@ export default function Home() {
 
           <nav className="mt-3 space-y-1" aria-label="Dashboard navigation">
             {navItems.map((item) => (
-              <a
+              <button
                 key={item.href}
-                href={item.href}
+                type="button"
                 onClick={() => {
                   setActiveSection(item.href)
                   setMobileNavOpen(false)
@@ -658,7 +792,7 @@ export default function Home() {
                 aria-current={
                   activeSection === item.href ? 'location' : undefined
                 }
-                className={`flex items-center gap-3 rounded-xl px-3 py-3 text-sm font-medium transition ${
+                className={`flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left text-sm font-medium transition ${
                   activeSection === item.href
                     ? 'bg-orange-50 text-orange-700'
                     : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
@@ -666,7 +800,7 @@ export default function Home() {
               >
                 {item.icon}
                 {item.label}
-              </a>
+              </button>
             ))}
 
             <button
@@ -719,7 +853,13 @@ export default function Home() {
               </button>
               <div>
                 <p className="text-sm font-semibold text-slate-800">
-                  Dashboard
+                  {{
+                    '#overview': 'Overview',
+                    '#analytics': 'Focus analytics',
+                    '#focus-timer': 'Focus timer',
+                    '#website-activity': 'Website activity',
+                    '#session-history': 'Session history',
+                  }[activeSection] || 'Overview'}
                 </p>
                 <p className="text-xs text-slate-400">
                   Your attention at a glance
@@ -740,6 +880,7 @@ export default function Home() {
                   className={refreshing ? 'animate-spin' : ''}
                 />
               </button>
+
               <button
                 type="button"
                 onClick={() => navigate('/settings')}
@@ -748,6 +889,7 @@ export default function Home() {
                 <SettingsIcon size={17} />
                 <span className="hidden sm:inline">Settings</span>
               </button>
+
               <button
                 type="button"
                 onClick={signOut}
@@ -763,6 +905,8 @@ export default function Home() {
         <main className="mx-auto max-w-7xl px-5 py-8 md:px-7 md:py-10">
           <div
             id="overview"
+            hidden={activeSection !== '#overview'}
+            style={{ display: activeSection === '#overview' ? undefined : 'none' }}
             className="mb-8 scroll-mt-24 flex flex-wrap items-end justify-between gap-4"
           >
             <div>
@@ -774,6 +918,7 @@ export default function Home() {
                 Understand your habits. Protect your attention.
               </p>
             </div>
+
             <div className="flex items-center gap-2 rounded-full border border-orange-100 bg-orange-50 px-4 py-2 text-sm font-medium text-orange-700">
               <Target size={17} />
               Daily goal: {dailyGoal} minutes
@@ -781,7 +926,10 @@ export default function Home() {
           </div>
 
           {error && (
-            <div role="alert" className="mb-5 rounded-xl bg-red-50 p-4 text-sm text-red-700">
+            <div
+              role="alert"
+              className="mb-5 rounded-xl bg-red-50 p-4 text-sm text-red-700"
+            >
               {error}
             </div>
           )}
@@ -792,7 +940,8 @@ export default function Home() {
             </div>
           ) : (
             <>
-              <section className="mb-8 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+              {/* Dashboard statistics */}
+              <section hidden={activeSection !== '#overview'} style={{ display: activeSection === '#overview' ? undefined : 'none' }} className="mb-8 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
                 <StatCard
                   icon={<Clock3 size={21} />}
                   label="Focus time today"
@@ -819,58 +968,234 @@ export default function Home() {
                 />
               </section>
 
+              {/* Weekly analytics charts */}
               <section
                 id="analytics"
+                hidden={activeSection !== '#analytics'}
+                style={{ display: activeSection === '#analytics' ? undefined : 'none' }}
                 className="mb-8 scroll-mt-24 grid gap-6 xl:grid-cols-5"
               >
                 <div className="rounded-3xl border border-slate-200 bg-white p-5 md:p-7 xl:col-span-3">
-                  <p className="text-sm font-semibold text-orange-600">YOUR ACTIVITY</p>
-                  <h2 className="mt-1 text-xl font-bold">Weekly focus time</h2>
+                  <p className="text-sm font-semibold text-orange-600">
+                    YOUR ACTIVITY
+                  </p>
+                  <h2 className="mt-1 text-xl font-bold">
+                    Weekly focus time
+                  </h2>
                   <p className="mb-6 mt-1 text-sm text-slate-500">
                     Completed focus minutes over the last 7 days
                   </p>
+
                   <div className="h-64 w-full">
                     <ResponsiveContainer width="100%" height="100%">
-                      <BarChart data={chartData} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
-                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                        <XAxis dataKey="day" tickLine={false} axisLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-                        <YAxis allowDecimals={false} tickLine={false} axisLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-                        <Tooltip formatter={(value) => [`${value} min`, 'Focus time']} />
-                        <Bar dataKey="focus" fill="#f97316" radius={[6, 6, 0, 0]} maxBarSize={38} />
+                      <BarChart
+                        data={chartData}
+                        margin={{ top: 8, right: 8, left: -18, bottom: 0 }}
+                      >
+                        <CartesianGrid
+                          strokeDasharray="3 3"
+                          vertical={false}
+                          stroke="#e2e8f0"
+                        />
+                        <XAxis
+                          dataKey="day"
+                          tickLine={false}
+                          axisLine={false}
+                          tick={{ fill: '#64748b', fontSize: 12 }}
+                        />
+                        <YAxis
+                          allowDecimals={false}
+                          tickLine={false}
+                          axisLine={false}
+                          tick={{ fill: '#64748b', fontSize: 12 }}
+                        />
+                        <Tooltip
+                          formatter={(value) => [`${value} min`, 'Focus time']}
+                        />
+                        <Bar
+                          dataKey="focus"
+                          fill="#f97316"
+                          radius={[6, 6, 0, 0]}
+                          maxBarSize={38}
+                        />
                       </BarChart>
                     </ResponsiveContainer>
                   </div>
                 </div>
 
                 <div className="rounded-3xl border border-slate-200 bg-white p-5 md:p-7 xl:col-span-2">
-                  <p className="text-sm font-semibold text-orange-600">CONSISTENCY</p>
+                  <p className="text-sm font-semibold text-orange-600">
+                    CONSISTENCY
+                  </p>
                   <h2 className="mt-1 text-xl font-bold">Focus trend</h2>
                   <p className="mb-6 mt-1 text-sm text-slate-500">
                     Your completed minutes each day
                   </p>
+
                   <div className="h-64 w-full">
                     <ResponsiveContainer width="100%" height="100%">
-                      <LineChart data={chartData} margin={{ top: 8, right: 8, left: -18, bottom: 0 }}>
-                        <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#e2e8f0" />
-                        <XAxis dataKey="day" tickLine={false} axisLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-                        <YAxis allowDecimals={false} tickLine={false} axisLine={false} tick={{ fill: '#64748b', fontSize: 12 }} />
-                        <Tooltip formatter={(value) => [`${value} min`, 'Focus time']} />
-                        <Line type="monotone" dataKey="focus" stroke="#ea580c" strokeWidth={3} dot={{ r: 4, fill: '#ea580c' }} activeDot={{ r: 6 }} />
+                      <LineChart
+                        data={chartData}
+                        margin={{ top: 8, right: 8, left: -18, bottom: 0 }}
+                      >
+                        <CartesianGrid
+                          strokeDasharray="3 3"
+                          vertical={false}
+                          stroke="#e2e8f0"
+                        />
+                        <XAxis
+                          dataKey="day"
+                          tickLine={false}
+                          axisLine={false}
+                          tick={{ fill: '#64748b', fontSize: 12 }}
+                        />
+                        <YAxis
+                          allowDecimals={false}
+                          tickLine={false}
+                          axisLine={false}
+                          tick={{ fill: '#64748b', fontSize: 12 }}
+                        />
+                        <Tooltip
+                          formatter={(value) => [`${value} min`, 'Focus time']}
+                        />
+                        <Line
+                          type="monotone"
+                          dataKey="focus"
+                          stroke="#ea580c"
+                          strokeWidth={3}
+                          dot={{ r: 4, fill: '#ea580c' }}
+                          activeDot={{ r: 6 }}
+                        />
                       </LineChart>
                     </ResponsiveContainer>
                   </div>
                 </div>
               </section>
 
+              {/* AI prediction section */}
+              <section
+                id="ai-predictions"
+                hidden={activeSection !== '#overview'}
+                style={{ display: activeSection === '#overview' ? undefined : 'none' }}
+                className="mb-8 scroll-mt-24 rounded-3xl border border-slate-200 bg-white p-5 md:p-7"
+              >
+                <div className="flex flex-wrap items-start justify-between gap-4">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <Brain size={22} className="text-orange-500" />
+                      <h2 className="text-xl font-bold">
+                        AI Focus Predictions
+                      </h2>
+                    </div>
+                    <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">
+                      Use your trained machine-learning models to estimate
+                      focus, productivity, attention stability, distraction,
+                      and focus degradation risk.
+                    </p>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={loadMLPredictions}
+                    disabled={mlLoading}
+                    className="flex items-center gap-2 rounded-xl bg-orange-500 px-4 py-3 text-sm font-semibold text-white transition hover:bg-orange-600 disabled:cursor-not-allowed disabled:opacity-60"
+                  >
+                    {mlLoading ? (
+                      <RefreshCw size={17} className="animate-spin" />
+                    ) : (
+                      <Brain size={17} />
+                    )}
+                    {mlLoading ? 'Generating...' : 'Generate predictions'}
+                  </button>
+                </div>
+
+                <div className="mt-5 rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm leading-6 text-amber-800">
+                  <strong>Experimental model:</strong> Predictions now use your saved focus-session data, website activity, and automatically collected browser metrics. Clicks, keystrokes, notifications, and sleep are not collected by the extension, so the current model receives zero defaults for those unavailable signals. The models were trained on synthetic data and are not validated real-world assessments.
+                </div>
+
+                <div className="mt-5 grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
+                  <MetricSummary label="Tab switches today" value={metricsLoading ? 'Loading…' : (trackingMetrics?.tab_switches ?? 0)} />
+                  <MetricSummary label="Active browser time" value={metricsLoading ? 'Loading…' : formatDuration(trackingMetrics?.active_seconds ?? 0)} />
+                  <MetricSummary label="Idle time" value={metricsLoading ? 'Loading…' : formatDuration(trackingMetrics?.idle_seconds ?? 0)} />
+                  <MetricSummary label="Metrics status" value={trackingMetrics?.available ? 'Collected' : 'No data yet'} />
+                </div>
+
+                {mlError && (
+                  <div
+                    role="alert"
+                    className="mt-4 rounded-xl bg-red-50 p-4 text-sm text-red-700"
+                  >
+                    {mlError}
+                  </div>
+                )}
+
+                {mlPredictions && (
+                  <div className="mt-6">
+                    <h3 className="mb-4 font-semibold text-slate-800">
+                      Prediction results
+                    </h3>
+
+                    <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-3">
+                      <PredictionCard
+                        label="Focus score"
+                        value={mlPredictions.focus_score}
+                        suffix="/ 100"
+                      />
+                      <PredictionCard
+                        label="Productivity score"
+                        value={mlPredictions.productivity_score}
+                        suffix="/ 100"
+                      />
+                      <PredictionCard
+                        label="Attention stability"
+                        value={mlPredictions.attention_stability_score}
+                        suffix="/ 100"
+                      />
+                      <PredictionCard
+                        label="Distraction analysis"
+                        value={`${mlPredictions.distraction_analysis} (${mlPredictions.distraction_score}/100)`}
+                        note={mlPredictions.distraction_data_available
+                          ? 'Calculated from tab switches, idle time, and website categories'
+                          : 'Calculated from tab switches and idle time; no categorized website time available'}
+                      />
+                      <PredictionCard
+                        label="Focus degradation risk"
+                        value={mlPredictions.focus_degradation_risk}
+                        suffix="/ 100"
+                      />
+                    </div>
+                  </div>
+                )}
+
+                {!mlPredictions && !mlLoading && !mlError && (
+                  <div className="mt-6 rounded-2xl bg-slate-50 px-4 py-8 text-center">
+                    <Brain size={30} className="mx-auto text-slate-300" />
+                    <p className="mt-3 font-semibold text-slate-700">
+                      No predictions generated yet
+                    </p>
+                    <p className="mt-1 text-sm text-slate-500">
+                      Start or complete a focus session, then generate predictions using your available tracking data.
+                    </p>
+                  </div>
+                )}
+              </section>
+
+              {/* Focus timer */}
               <section
                 id="focus-timer"
+                hidden={activeSection !== '#focus-timer'}
+                style={{ display: activeSection === '#focus-timer' ? undefined : 'none' }}
                 className="mb-8 scroll-mt-24 grid gap-6 xl:grid-cols-5"
               >
                 <div className="rounded-3xl border border-slate-200 bg-white p-6 md:p-8 xl:col-span-3">
                   <div className="flex items-center justify-between gap-4">
                     <div>
-                      <p className="text-sm font-semibold text-orange-600">FOCUS SESSION</p>
-                      <h2 className="mt-2 text-2xl font-bold">Time to concentrate</h2>
+                      <p className="text-sm font-semibold text-orange-600">
+                        FOCUS SESSION
+                      </p>
+                      <h2 className="mt-2 text-2xl font-bold">
+                        Time to concentrate
+                      </h2>
                     </div>
                     <span className="rounded-2xl bg-orange-50 p-3 text-orange-600">
                       <Clock3 size={24} />
@@ -883,7 +1208,11 @@ export default function Home() {
                         {formatTime(seconds)}
                       </span>
                       <span className="mt-2 text-sm text-slate-500">
-                        {isRunning ? 'Stay focused' : session ? 'Session paused' : 'Ready when you are'}
+                        {isRunning
+                          ? 'Stay focused'
+                          : session
+                            ? 'Session paused'
+                            : 'Ready when you are'}
                       </span>
                     </div>
 
@@ -894,9 +1223,20 @@ export default function Home() {
                         disabled={loading || initialLoading}
                         className="flex items-center gap-2 rounded-xl bg-orange-500 px-6 py-3 font-semibold text-white hover:bg-orange-600 disabled:opacity-60"
                       >
-                        {isRunning ? <Pause size={18} /> : <Play size={18} />}
-                        {loading ? 'Please wait...' : isRunning ? 'Pause' : session ? 'Resume' : 'Start focus'}
+                        {isRunning ? (
+                          <Pause size={18} />
+                        ) : (
+                          <Play size={18} />
+                        )}
+                        {loading
+                          ? 'Please wait...'
+                          : isRunning
+                            ? 'Pause'
+                            : session
+                              ? 'Resume'
+                              : 'Start focus'}
                       </button>
+
                       <button
                         type="button"
                         onClick={resetTimer}
@@ -910,9 +1250,19 @@ export default function Home() {
                     </div>
 
                     <p className="mt-4 text-xs text-slate-400">
-                      {session ? `${session.goal_minutes}-minute session` : '25-minute focus session'}
+                      {session
+                        ? `${session.goal_minutes}-minute session`
+                        : '25-minute focus session'}
                     </p>
-                    {notice && <p role="status" className="mt-4 text-center text-sm text-emerald-700">{notice}</p>}
+
+                    {notice && (
+                      <p
+                        role="status"
+                        className="mt-4 text-center text-sm text-emerald-700"
+                      >
+                        {notice}
+                      </p>
+                    )}
                   </div>
                 </div>
 
@@ -921,29 +1271,45 @@ export default function Home() {
                     <div className="w-fit rounded-xl bg-orange-500/15 p-3 text-orange-400">
                       <Flame size={24} />
                     </div>
-                    <h3 className="mt-5 text-xl font-bold">Today's focus tip</h3>
+                    <h3 className="mt-5 text-xl font-bold">
+                      Today's focus tip
+                    </h3>
                     <p className="mt-3 leading-7 text-slate-300">
-                      Silence unnecessary notifications and work on one task at a time. Small changes can make a big difference.
+                      Silence unnecessary notifications and work on one task
+                      at a time. Small changes can make a big difference.
                     </p>
                   </div>
 
                   <div className="rounded-3xl border border-slate-200 bg-white p-7">
                     <div className="flex items-center justify-between">
-                      <h3 className="text-lg font-bold">Daily goal progress</h3>
+                      <h3 className="text-lg font-bold">
+                        Daily goal progress
+                      </h3>
                       <Target size={21} className="text-orange-500" />
                     </div>
+
                     <div className="mt-5 h-3 overflow-hidden rounded-full bg-slate-100">
-                      <div className="h-full rounded-full bg-orange-500 transition-all" style={{ width: `${goalProgress}%` }} />
+                      <div
+                        className="h-full rounded-full bg-orange-500 transition-all"
+                        style={{ width: `${goalProgress}%` }}
+                      />
                     </div>
+
                     <div className="mt-3 flex items-center justify-between text-sm">
-                      <span className="text-slate-500">{focusMinutes} / {dailyGoal} min</span>
-                      <span className="font-semibold text-orange-600">{goalProgress}%</span>
+                      <span className="text-slate-500">
+                        {focusMinutes} / {dailyGoal} min
+                      </span>
+                      <span className="font-semibold text-orange-600">
+                        {goalProgress}%
+                      </span>
                     </div>
+
                     <p className="mt-4 text-sm text-slate-500">
                       {goalProgress >= 100
                         ? 'Daily goal achieved. Great work!'
                         : `${Math.max(0, dailyGoal - focusMinutes)} more minutes to reach your goal.`}
                     </p>
+
                     <button
                       type="button"
                       onClick={() => navigate('/settings')}
@@ -954,49 +1320,77 @@ export default function Home() {
                   </div>
                 </div>
               </section>
-
+                            {/* Website activity */}
               <section
                 id="website-activity"
+                hidden={activeSection !== '#website-activity'}
+                style={{ display: activeSection === '#website-activity' ? undefined : 'none' }}
                 className="mb-8 scroll-mt-24 rounded-3xl border border-slate-200 bg-white p-5 md:p-7"
               >
                 <div className="mb-6 flex flex-wrap items-start justify-between gap-4">
                   <div>
                     <div className="flex items-center gap-2">
                       <Globe size={21} className="text-orange-500" />
-                      <h2 className="text-xl font-bold">Website activity</h2>
+                      <h2 className="text-xl font-bold">
+                        Website activity
+                      </h2>
                     </div>
                     <p className="mt-1 text-sm text-slate-500">
                       Browsing activity synced from your FocusFlow Chrome extension
                     </p>
                   </div>
+
                   <button
                     type="button"
                     onClick={loadWebsiteActivity}
                     disabled={activityLoading}
                     className="flex items-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50"
                   >
-                    <RefreshCw size={15} className={activityLoading ? 'animate-spin' : ''} />
+                    <RefreshCw
+                      size={15}
+                      className={activityLoading ? 'animate-spin' : ''}
+                    />
                     Refresh activity
                   </button>
                 </div>
 
                 <div className="mb-6 grid gap-4 sm:grid-cols-2">
                   <div className="rounded-2xl bg-orange-50 p-5">
-                    <p className="text-sm text-orange-700">Today's browsing time</p>
-                    <p className="mt-2 text-3xl font-bold text-orange-700">{formatDuration(todayWebsiteSeconds)}</p>
-                    <p className="mt-1 text-xs text-orange-700/80">{todayActivity.length} recorded website entries today</p>
+                    <p className="text-sm text-orange-700">
+                      Today's browsing time
+                    </p>
+                    <p className="mt-2 text-3xl font-bold text-orange-700">
+                      {formatDuration(todayWebsiteSeconds)}
+                    </p>
+                    <p className="mt-1 text-xs text-orange-700/80">
+                      {todayActivity.length} recorded website entries today
+                    </p>
                   </div>
+
                   <div className="rounded-2xl border border-slate-100 p-5">
-                    <p className="text-sm text-slate-500">Websites in the last 7 days</p>
-                    <p className="mt-2 text-3xl font-bold">{websiteTotals.length}</p>
+                    <p className="text-sm text-slate-500">
+                      Websites in the last 7 days
+                    </p>
+                    <p className="mt-2 text-3xl font-bold">
+                      {websiteTotals.length}
+                    </p>
                     <p className="mt-1 text-xs text-slate-400">
-                      Total tracked time: {formatDuration(websiteTotals.reduce((sum, site) => sum + site.seconds, 0))}
+                      Total tracked time:{' '}
+                      {formatDuration(
+                        websiteTotals.reduce(
+                          (sum, site) => sum + site.seconds,
+                          0,
+                        ),
+                      )}
                     </p>
                   </div>
                 </div>
 
                 {activityError && (
-                  <div role="alert" className="mb-4 rounded-xl bg-red-50 p-4 text-sm text-red-700">
+                  <div
+                    role="alert"
+                    className="mb-4 rounded-xl bg-red-50 p-4 text-sm text-red-700"
+                  >
                     {activityError}
                   </div>
                 )}
@@ -1008,7 +1402,9 @@ export default function Home() {
                 ) : websiteTotals.length === 0 ? (
                   <div className="rounded-2xl bg-slate-50 px-4 py-10 text-center">
                     <Globe size={30} className="mx-auto text-slate-300" />
-                    <p className="mt-3 font-semibold">No synced website activity yet</p>
+                    <p className="mt-3 font-semibold">
+                      No synced website activity yet
+                    </p>
                     <p className="mt-1 text-sm text-slate-500">
                       Sync activity from the extension, then refresh this section.
                     </p>
@@ -1019,54 +1415,80 @@ export default function Home() {
                       <thead>
                         <tr className="border-b border-slate-100 text-xs uppercase tracking-wide text-slate-400">
                           <th className="px-3 py-3 font-medium">Website</th>
-                          <th className="px-3 py-3 font-medium">Tracked time</th>
+                          <th className="px-3 py-3 font-medium">
+                            Tracked time
+                          </th>
                           <th className="px-3 py-3 font-medium">Category</th>
-                          <th className="px-3 py-3 font-medium">Last tracked</th>
+                          <th className="px-3 py-3 font-medium">
+                            Last tracked
+                          </th>
                         </tr>
                       </thead>
+
                       <tbody>
                         {websiteTotals.map((site) => (
-                          <tr key={site.domain} className="border-b border-slate-50 last:border-0">
+                          <tr
+                            key={site.domain}
+                            className="border-b border-slate-50 last:border-0"
+                          >
                             <td className="px-3 py-4">
                               <div className="flex items-center gap-2">
                                 <span className="rounded-lg bg-slate-100 p-2 text-slate-500">
                                   <Globe size={16} />
                                 </span>
-                                <span className="max-w-[220px] break-all font-medium text-slate-800">{site.domain}</span>
+                                <span className="max-w-[220px] break-all font-medium text-slate-800">
+                                  {site.domain}
+                                </span>
                               </div>
                             </td>
-                            <td className="px-3 py-4 font-semibold text-slate-700">{formatDuration(site.seconds)}</td>
+
+                            <td className="px-3 py-4 font-semibold text-slate-700">
+                              {formatDuration(site.seconds)}
+                            </td>
+
                             <td className="px-3 py-4">
-                              <span className={`rounded-full px-2.5 py-1 text-xs font-semibold ${categoryClass(site.category)}`}>
+                              <span
+                                className={`rounded-full px-2.5 py-1 text-xs font-semibold ${categoryClass(site.category)}`}
+                              >
                                 {categoryLabel(site.category)}
                               </span>
                             </td>
-                            <td className="px-3 py-4 text-slate-500">{formatActivityDate(site.lastDate)}</td>
+
+                            <td className="px-3 py-4 text-slate-500">
+                              {formatActivityDate(site.lastDate)}
+                            </td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
                   </div>
                 )}
+
                 <p className="mt-4 text-xs text-slate-400">
                   Activity appears here after it has been synced from the extension to your account.
                 </p>
               </section>
 
+              {/* Recent focus sessions */}
               <section
                 id="session-history"
+                hidden={activeSection !== '#session-history'}
+                style={{ display: activeSection === '#session-history' ? undefined : 'none' }}
                 className="scroll-mt-24 rounded-3xl border border-slate-200 bg-white p-5 md:p-7"
               >
                 <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
                   <div>
                     <div className="flex items-center gap-2">
                       <History size={20} className="text-orange-500" />
-                      <h2 className="text-xl font-bold">Recent focus sessions</h2>
+                      <h2 className="text-xl font-bold">
+                        Recent focus sessions
+                      </h2>
                     </div>
                     <p className="mt-1 text-sm text-slate-500">
                       Your latest sessions saved in FocusFlow
                     </p>
                   </div>
+
                   <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-medium text-slate-600">
                     Latest {Math.min(allSessions.length, 8)}
                   </span>
@@ -1075,7 +1497,9 @@ export default function Home() {
                 {allSessions.length === 0 ? (
                   <div className="rounded-2xl bg-slate-50 px-4 py-10 text-center">
                     <Clock3 size={30} className="mx-auto text-slate-300" />
-                    <p className="mt-3 font-semibold">No focus sessions yet</p>
+                    <p className="mt-3 font-semibold">
+                      No focus sessions yet
+                    </p>
                     <p className="mt-1 text-sm text-slate-500">
                       Start your first session and your history will appear here.
                     </p>
@@ -1091,24 +1515,42 @@ export default function Home() {
                           <th className="px-3 py-3 font-medium">Status</th>
                         </tr>
                       </thead>
+
                       <tbody>
                         {allSessions.slice(0, 8).map((item) => (
-                          <tr key={item.id} className="border-b border-slate-50 last:border-0">
+                          <tr
+                            key={item.id}
+                            className="border-b border-slate-50 last:border-0"
+                          >
                             <td className="px-3 py-4">
-                              <p className="font-medium text-slate-800">Focus session</p>
+                              <p className="font-medium text-slate-800">
+                                Focus session
+                              </p>
                               <p className="mt-1 text-xs text-slate-400">
-                                {formatDate(item.created_at || item.started_at)}
+                                {formatDate(
+                                  item.created_at || item.started_at,
+                                )}
                               </p>
                             </td>
-                            <td className="px-3 py-4 text-slate-600">{item.goal_minutes} min</td>
-                            <td className="px-3 py-4 text-slate-600">{formatMinutes(getDuration(item))}</td>
-                            <td className="px-3 py-4"><StatusBadge status={item.status} /></td>
+
+                            <td className="px-3 py-4 text-slate-600">
+                              {item.goal_minutes} min
+                            </td>
+
+                            <td className="px-3 py-4 text-slate-600">
+                              {formatMinutes(getDuration(item))}
+                            </td>
+
+                            <td className="px-3 py-4">
+                              <StatusBadge status={item.status} />
+                            </td>
                           </tr>
                         ))}
                       </tbody>
                     </table>
                   </div>
                 )}
+
                 <p className="mt-4 text-xs text-slate-400">
                   Analytics use the latest 100 focus sessions returned by the API.
                 </p>
@@ -1121,19 +1563,24 @@ export default function Home() {
   )
 }
 
+/* Dashboard statistic card */
 function StatCard({ icon, label, value, detail }) {
   return (
     <div className="rounded-2xl border border-slate-200 bg-white p-5">
       <div className="flex items-center justify-between gap-3">
         <p className="text-sm text-slate-500">{label}</p>
-        <span className="rounded-xl bg-orange-50 p-2 text-orange-500">{icon}</span>
+        <span className="rounded-xl bg-orange-50 p-2 text-orange-500">
+          {icon}
+        </span>
       </div>
+
       <p className="mt-4 text-3xl font-bold">{value}</p>
       <p className="mt-2 text-xs text-slate-400">{detail}</p>
     </div>
   )
 }
 
+/* Session status badge */
 function StatusBadge({ status }) {
   const styles = {
     completed: 'bg-emerald-50 text-emerald-700',
@@ -1142,10 +1589,47 @@ function StatusBadge({ status }) {
   }
 
   return (
-    <span className={`rounded-full px-2.5 py-1 text-xs font-semibold capitalize ${
-      styles[status] || 'bg-slate-100 text-slate-600'
-    }`}>
+    <span
+      className={`rounded-full px-2.5 py-1 text-xs font-semibold capitalize ${
+        styles[status] || 'bg-slate-100 text-slate-600'
+      }`}
+    >
       {status || 'unknown'}
     </span>
+  )
+}
+
+/* Automatically collected metric summary card */
+function MetricSummary({ label, value }) {
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+      <p className="text-xs font-medium text-slate-500">{label}</p>
+      <p className="mt-2 text-lg font-bold text-slate-900">{value}</p>
+    </div>
+  )
+}
+
+/* AI prediction result card */
+function PredictionCard({ label, value, suffix = '', note = 'Experimental model estimate' }) {
+  const displayValue =
+    typeof value === 'number' ? Number(value.toFixed(2)) : value
+
+  return (
+    <div className="rounded-2xl border border-slate-200 bg-slate-50 p-5">
+      <p className="text-sm text-slate-500">{label}</p>
+
+      <p className="mt-3 break-words text-2xl font-bold text-slate-900">
+        {displayValue ?? '—'}
+        {suffix && (
+          <span className="ml-1 text-sm font-medium text-slate-400">
+            {suffix}
+          </span>
+        )}
+      </p>
+
+      <p className="mt-2 text-xs text-slate-400">
+        {note}
+      </p>
+    </div>
   )
 }

@@ -9,6 +9,7 @@ from app.sessions import router as sessions_router
 from app.auth import router as auth_router
 from app.activity import router as activity_router
 from app.profile import router as profile_router
+from app.analytics import router as analytics_router
 
 
 @asynccontextmanager
@@ -65,3 +66,4 @@ app.include_router(auth_router)
 app.include_router(sessions_router)
 app.include_router(activity_router)
 app.include_router(profile_router)
+app.include_router(analytics_router)
