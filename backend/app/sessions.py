@@ -110,7 +110,7 @@ def get_current_user(
 
 
 class StartSessionRequest(BaseModel):
-    goal_minutes: int = Field(default=25, ge=1, le=180)
+    goal_minutes: int = Field(default=20, ge=1, le=180)
 
 
 def session_response(session):

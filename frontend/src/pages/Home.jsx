@@ -3,7 +3,8 @@ import { useNavigate } from 'react-router-dom'
 import {
   Brain, Clock3, Target, Play, Pause, RotateCcw, LogOut,
   Flame, TrendingUp, CalendarDays, CheckCircle2, History,
-  RefreshCw, Globe, LayoutDashboard, Menu, Settings as SettingsIcon,
+  RefreshCw, Globe, LayoutDashboard, Menu, Settings as SettingsIcon, Lightbulb,
+  Coffee, SkipForward,
 } from 'lucide-react'
 import {
   ResponsiveContainer, BarChart, Bar, LineChart, Line,
@@ -171,6 +172,20 @@ export default function Home() {
   const [trackingMetrics, setTrackingMetrics] = useState(null)
   const [metricsLoading, setMetricsLoading] = useState(false)
 
+  // Recommendation Engine state
+  const [recommendations, setRecommendations] = useState([])
+  const [recommendationsLoading, setRecommendationsLoading] = useState(false)
+  const [recommendationsError, setRecommendationsError] = useState('')
+
+  // Break scheduling state
+  const [breakSession, setBreakSession] = useState(null)
+  const [breakRemaining, setBreakRemaining] = useState(0)
+  const [breakRunning, setBreakRunning] = useState(false)
+  const [breakLoading, setBreakLoading] = useState(false)
+  const [breakHistory, setBreakHistory] = useState([])
+  const [breakError, setBreakError] = useState('')
+  const [breakSuggestion, setBreakSuggestion] = useState(null)
+
   let user = null
 
   try {
@@ -223,6 +238,64 @@ export default function Home() {
     return data
   }, [navigate, token])
 
+  // Load break history and restore an active break after refresh.
+  const loadBreaks = useCallback(async () => {
+    const data = await request('/api/breaks?limit=30')
+    const items = Array.isArray(data) ? data : (data.breaks || [])
+    setBreakHistory(items)
+    const active = items.find((item) => item.status === 'running' || item.status === 'paused')
+    if (active) {
+      setBreakSession(active)
+      setBreakRunning(active.status === 'running')
+      setBreakRemaining(Math.max(0, Number(active.remaining_seconds) || 0))
+    } else {
+      setBreakSession(null)
+      setBreakRunning(false)
+      setBreakRemaining(0)
+    }
+    return items
+  }, [request])
+
+  const startBreak = async (breakType = 'short') => {
+    setBreakLoading(true)
+    setBreakError('')
+    try {
+      const duration = breakType === 'long' ? 15 : 5
+      const data = await request('/api/breaks/start', {
+        method: 'POST',
+        body: JSON.stringify({ break_type: breakType, duration_minutes: duration }),
+      })
+      setBreakSession(data)
+      setBreakRemaining(duration * 60)
+      setBreakRunning(true)
+      setBreakSuggestion(null)
+      await loadBreaks()
+    } catch (err) {
+      setBreakError(err.message || 'Could not start break.')
+    } finally {
+      setBreakLoading(false)
+    }
+  }
+
+  const controlBreak = async (action) => {
+    if (!breakSession) return
+    setBreakLoading(true)
+    setBreakError('')
+    try {
+      const endpoint = action === 'pause' ? 'pause'
+        : action === 'resume' ? 'resume'
+        : action === 'complete' ? 'complete' : 'skip'
+      await request(`/api/breaks/${breakSession.id}/${endpoint}`, { method: 'POST' })
+      await loadBreaks()
+      if (action === 'complete') setNotice('Break completed. Ready for your next focus session!')
+      if (action === 'skip') setNotice('Break skipped.')
+    } catch (err) {
+      setBreakError(err.message || 'Could not update break.')
+    } finally {
+      setBreakLoading(false)
+    }
+  }
+
   // Load the browser metrics automatically collected by the Chrome extension.
   const loadTrackingMetrics = useCallback(async () => {
     setMetricsLoading(true)
@@ -234,6 +307,53 @@ export default function Home() {
       setMetricsLoading(false)
     }
   }, [request])
+
+  // Load active recommendations from the backend.
+  const loadRecommendations = useCallback(async () => {
+    setRecommendationsLoading(true)
+    setRecommendationsError('')
+
+    try {
+      const data = await request('/api/recommendations?days=30&status=active')
+      const items = Array.isArray(data)
+        ? data
+        : data.recommendations || data.items || []
+      setRecommendations(items)
+      return items
+    } catch (err) {
+      setRecommendationsError(err.message || 'Could not load recommendations.')
+      return []
+    } finally {
+      setRecommendationsLoading(false)
+    }
+  }, [request])
+
+  // Generate recommendations and reload the active list.
+  const generateRecommendations = useCallback(async () => {
+    setRecommendationsError('')
+    try {
+      await request('/api/recommendations/generate', {
+        method: 'POST',
+        body: JSON.stringify({ force: false }),
+      })
+      await loadRecommendations()
+    } catch (err) {
+      setRecommendationsError(err.message || 'Could not generate recommendations.')
+    }
+  }, [request, loadRecommendations])
+
+  // Update a recommendation's status.
+  const handleRecommendationAction = async (recommendationId, action) => {
+    try {
+      await request(`/api/recommendations/${recommendationId}/action`, {
+        method: 'PATCH',
+        body: JSON.stringify({ action }),
+      })
+      await loadRecommendations()
+    } catch (err) {
+      setRecommendationsError(err.message || 'Could not update recommendation.')
+    }
+  }
 
   // Build prediction features from actual FocusFlow records and extension metrics.
   // Some model features are not collected by this extension; those are sent as
@@ -445,6 +565,7 @@ export default function Home() {
         if (!cancelled) {
           await loadWebsiteActivity()
           await loadTrackingMetrics()
+          await loadBreaks()
         }
       } catch (err) {
         if (!cancelled) {
@@ -469,7 +590,32 @@ export default function Home() {
     loadSessions,
     loadWebsiteActivity,
     loadTrackingMetrics,
+    loadBreaks,
   ])
+
+  // Generate recommendations when the dashboard opens and every 15 minutes.
+  useEffect(() => {
+    if (!token) return
+
+    generateRecommendations()
+    const interval = setInterval(generateRecommendations, 15 * 60 * 1000)
+    return () => clearInterval(interval)
+  }, [token, generateRecommendations])
+
+  // Keep the break countdown independent from the focus timer.
+  useEffect(() => {
+    if (!breakRunning || !breakSession) return
+    const timer = setInterval(() => {
+      setBreakRemaining((previous) => Math.max(0, previous - 1))
+    }, 1000)
+    return () => clearInterval(timer)
+  }, [breakRunning, breakSession?.id])
+
+  useEffect(() => {
+    if (breakRunning && breakSession && breakRemaining === 0 && !breakLoading) {
+      controlBreak('complete')
+    }
+  }, [breakRemaining, breakRunning, breakSession?.id, breakLoading])
 
   useEffect(() => {
     if (!isRunning || !session) return
@@ -662,6 +808,15 @@ export default function Home() {
       setSeconds(SESSION_LENGTH)
 
       await loadSessions()
+      await generateRecommendations()
+
+      if (timerCompleted) {
+        const nextCompletedCount = completedCount + 1
+        setBreakSuggestion({
+          type: nextCompletedCount > 0 && nextCompletedCount % 4 === 0 ? 'long' : 'short',
+          duration: nextCompletedCount > 0 && nextCompletedCount % 4 === 0 ? 15 : 5,
+        })
+      }
 
       setNotice(
         timerCompleted
@@ -802,6 +957,18 @@ export default function Home() {
                 {item.label}
               </button>
             ))}
+
+            <button
+              type="button"
+              onClick={() => {
+                setMobileNavOpen(false)
+                navigate('/recommendations')
+              }}
+              className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-medium text-slate-600 transition hover:bg-orange-50 hover:text-orange-700"
+            >
+              <Lightbulb size={18} />
+              Recommendations
+            </button>
 
             <button
               type="button"
@@ -966,6 +1133,62 @@ export default function Home() {
                   value={formatMinutes(averageMinutes * 60)}
                   detail="Completed focus time per day"
                 />
+              </section>
+
+              {/* Personalized recommendations */}
+              <section
+                hidden={activeSection !== '#overview'}
+                style={{ display: activeSection === '#overview' ? undefined : 'none' }}
+                className="mb-8 rounded-3xl border border-slate-200 bg-white p-5 md:p-7"
+              >
+                <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <Lightbulb size={21} className="text-orange-500" />
+                      <h2 className="text-xl font-bold">Personalized recommendations</h2>
+                    </div>
+                    <p className="mt-1 text-sm text-slate-500">Suggestions based on your focus sessions and activity.</p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={generateRecommendations}
+                    disabled={recommendationsLoading}
+                    className="flex items-center gap-2 rounded-xl border border-slate-200 px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50 disabled:opacity-50"
+                  >
+                    <RefreshCw size={15} className={recommendationsLoading ? 'animate-spin' : ''} />
+                    Refresh
+                  </button>
+                </div>
+
+                {recommendationsError && (
+                  <div role="alert" className="mb-4 rounded-xl bg-red-50 p-3 text-sm text-red-700">
+                    {recommendationsError}
+                  </div>
+                )}
+
+                {recommendationsLoading && recommendations.length === 0 ? (
+                  <p className="py-6 text-center text-sm text-slate-500">Loading recommendations...</p>
+                ) : recommendations.length === 0 ? (
+                  <div className="rounded-2xl bg-slate-50 p-6 text-center">
+                    <Lightbulb size={28} className="mx-auto text-slate-300" />
+                    <p className="mt-3 font-semibold text-slate-700">No active recommendations</p>
+                    <p className="mt-1 text-sm text-slate-500">Keep using FocusFlow to receive personalized suggestions.</p>
+                  </div>
+                ) : (
+                  <div className="grid gap-4 lg:grid-cols-2">
+                    {recommendations.slice(0, 4).map((item) => (
+                      <RecommendationCard key={item.recommendation_id} item={item} onAction={handleRecommendationAction} />
+                    ))}
+                  </div>
+                )}
+
+                <button
+                  type="button"
+                  onClick={() => navigate('/recommendations')}
+                  className="mt-5 text-sm font-semibold text-orange-600 hover:text-orange-700"
+                >
+                  View all recommendations →
+                </button>
               </section>
 
               {/* Weekly analytics charts */}
@@ -1220,7 +1443,7 @@ export default function Home() {
                       <button
                         type="button"
                         onClick={handleTimerButton}
-                        disabled={loading || initialLoading}
+                        disabled={loading || initialLoading || Boolean(breakSession)}
                         className="flex items-center gap-2 rounded-xl bg-orange-500 px-6 py-3 font-semibold text-white hover:bg-orange-600 disabled:opacity-60"
                       >
                         {isRunning ? (
@@ -1317,6 +1540,114 @@ export default function Home() {
                     >
                       Change daily goal
                     </button>
+                  </div>
+                </div>
+
+                {/* Break scheduling */}
+                <div className="rounded-3xl border border-slate-200 bg-white p-6 md:p-7 xl:col-span-5">
+                  <div className="flex flex-wrap items-start justify-between gap-4">
+                    <div className="flex items-start gap-3">
+                      <span className="rounded-xl bg-emerald-50 p-3 text-emerald-600">
+                        <Coffee size={22} />
+                      </span>
+                      <div>
+                        <h3 className="text-xl font-bold">Break scheduler</h3>
+                        <p className="mt-1 text-sm text-slate-500">
+                          Take short breaks between focus sessions and a longer break after every four completed sessions.
+                        </p>
+                      </div>
+                    </div>
+                    {breakSession && (
+                      <span className="rounded-full bg-emerald-50 px-3 py-1 text-xs font-semibold capitalize text-emerald-700">
+                        {breakSession.status} break
+                      </span>
+                    )}
+                  </div>
+
+                  {breakSuggestion && !breakSession && (
+                    <div className="mt-5 flex flex-wrap items-center justify-between gap-3 rounded-2xl border border-emerald-200 bg-emerald-50 p-4">
+                      <div>
+                        <p className="font-semibold text-emerald-900">
+                          Focus session complete — take a {breakSuggestion.duration}-minute {breakSuggestion.type} break?
+                        </p>
+                        <p className="mt-1 text-sm text-emerald-700">A short pause can help you reset before your next session.</p>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => startBreak(breakSuggestion.type)}
+                        disabled={breakLoading}
+                        className="rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-emerald-700 disabled:opacity-50"
+                      >
+                        Start suggested break
+                      </button>
+                    </div>
+                  )}
+
+                  {breakError && (
+                    <p role="alert" className="mt-4 rounded-xl bg-red-50 p-3 text-sm text-red-700">{breakError}</p>
+                  )}
+
+                  {breakSession ? (
+                    <div className="mt-5 flex flex-col items-center rounded-2xl bg-slate-50 p-6">
+                      <p className="text-sm font-semibold uppercase tracking-wide text-emerald-700">
+                        {breakSession.break_type === 'long' ? 'Long break' : 'Short break'}
+                      </p>
+                      <p className="mt-2 text-5xl font-bold tabular-nums text-slate-900">
+                        {formatTime(breakRemaining)}
+                      </p>
+                      <p className="mt-2 text-sm text-slate-500">
+                        {breakRunning ? 'Relax and recharge' : 'Break paused'}
+                      </p>
+                      <div className="mt-5 flex flex-wrap justify-center gap-2">
+                        {breakRunning ? (
+                          <button type="button" onClick={() => controlBreak('pause')} disabled={breakLoading} className="rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">
+                            <Pause size={16} className="mr-2 inline" />Pause
+                          </button>
+                        ) : (
+                          <button type="button" onClick={() => controlBreak('resume')} disabled={breakLoading} className="rounded-xl bg-emerald-600 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">
+                            <Play size={16} className="mr-2 inline" />Resume
+                          </button>
+                        )}
+                        <button type="button" onClick={() => controlBreak('skip')} disabled={breakLoading} className="rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-600 disabled:opacity-50">
+                          <SkipForward size={16} className="mr-2 inline" />Skip break
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="mt-5 grid gap-3 sm:grid-cols-2">
+                      <button type="button" onClick={() => startBreak('short')} disabled={breakLoading || Boolean(session)} className="rounded-2xl border border-slate-200 p-4 text-left transition hover:border-emerald-300 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50">
+                        <p className="font-semibold text-slate-800">Short break</p>
+                        <p className="mt-1 text-2xl font-bold text-emerald-700">5 minutes</p>
+                        <p className="mt-1 text-xs text-slate-500">A quick reset between focus sessions</p>
+                      </button>
+                      <button type="button" onClick={() => startBreak('long')} disabled={breakLoading || Boolean(session)} className="rounded-2xl border border-slate-200 p-4 text-left transition hover:border-emerald-300 hover:bg-emerald-50 disabled:cursor-not-allowed disabled:opacity-50">
+                        <p className="font-semibold text-slate-800">Long break</p>
+                        <p className="mt-1 text-2xl font-bold text-emerald-700">15 minutes</p>
+                        <p className="mt-1 text-xs text-slate-500">A longer recovery after four focus sessions</p>
+                      </button>
+                    </div>
+                  )}
+
+                  <div className="mt-6">
+                    <div className="mb-3 flex items-center justify-between">
+                      <h4 className="font-semibold text-slate-800">Recent break history</h4>
+                      <span className="text-xs text-slate-400">{breakHistory.length} records</span>
+                    </div>
+                    {breakHistory.length === 0 ? (
+                      <p className="rounded-xl bg-slate-50 p-4 text-sm text-slate-500">Your completed and skipped breaks will appear here.</p>
+                    ) : (
+                      <div className="space-y-2">
+                        {breakHistory.slice(0, 5).map((item) => (
+                          <div key={item.id} className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-100 px-4 py-3 text-sm">
+                            <div>
+                              <p className="font-medium capitalize text-slate-700">{item.break_type} break · {item.duration_minutes} min</p>
+                              <p className="mt-1 text-xs text-slate-400">{formatDate(item.created_at)}</p>
+                            </div>
+                            <span className="text-xs font-semibold capitalize text-slate-500">{item.status}</span>
+                          </div>
+                        ))}
+                      </div>
+                    )}
                   </div>
                 </div>
               </section>
@@ -1630,6 +1961,39 @@ function PredictionCard({ label, value, suffix = '', note = 'Experimental model 
       <p className="mt-2 text-xs text-slate-400">
         {note}
       </p>
+    </div>
+  )
+}
+
+/* Recommendation card */
+function RecommendationCard({ item, onAction }) {
+  const priorityStyles = {
+    high: 'bg-rose-50 text-rose-700',
+    medium: 'bg-amber-50 text-amber-700',
+    low: 'bg-emerald-50 text-emerald-700',
+  }
+
+  return (
+    <div className="rounded-2xl border border-slate-200 p-5">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="font-semibold text-slate-800">{item.title}</h3>
+          <p className="mt-2 text-sm leading-6 text-slate-600">{item.message}</p>
+        </div>
+        <span className={`shrink-0 rounded-full px-2.5 py-1 text-xs font-semibold capitalize ${priorityStyles[item.priority] || 'bg-slate-100 text-slate-600'}`}>
+          {item.priority || 'normal'}
+        </span>
+      </div>
+
+      {item.source === 'experimental_ml' && (
+        <p className="mt-3 text-xs text-amber-700">Experimental ML insight — not a validated assessment.</p>
+      )}
+
+      <div className="mt-5 flex flex-wrap gap-2">
+        <button type="button" onClick={() => onAction(item.recommendation_id, 'complete')} className="rounded-lg bg-orange-500 px-3 py-2 text-xs font-semibold text-white hover:bg-orange-600">Complete</button>
+        <button type="button" onClick={() => onAction(item.recommendation_id, 'save')} className="rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-50">Save for later</button>
+        <button type="button" onClick={() => onAction(item.recommendation_id, 'dismiss')} className="rounded-lg px-3 py-2 text-xs font-semibold text-slate-400 hover:bg-slate-50 hover:text-slate-700">Dismiss</button>
+      </div>
     </div>
   )
 }

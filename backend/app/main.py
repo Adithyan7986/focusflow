@@ -1,4 +1,3 @@
-
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
@@ -10,6 +9,8 @@ from app.auth import router as auth_router
 from app.activity import router as activity_router
 from app.profile import router as profile_router
 from app.analytics import router as analytics_router
+from app.recommendations import router as recommendations_router
+from app.breaks import router as breaks_router
 
 
 @asynccontextmanager
@@ -67,3 +68,5 @@ app.include_router(sessions_router)
 app.include_router(activity_router)
 app.include_router(profile_router)
 app.include_router(analytics_router)
+app.include_router(recommendations_router)
+app.include_router(breaks_router)
