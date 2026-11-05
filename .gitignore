@@ -1,12 +1,17 @@
+
 # Environment variables and secrets
 .env
 .env.*
 !.env.example
+**/.env
+**/.env.*
+!**/.env.example
 
 # Python
 __pycache__/
 *.py[cod]
 .venv/
+.venv_*/
 venv/
 backend/.venv_ml/
 
@@ -19,8 +24,19 @@ build/
 
 # Local databases and logs
 *.log
+*.sqlite
+*.db
 
 # Electron generated builds
 desktop-app/release/
 desktop-app/frontend-dist/
 desktop-app/node_modules/
+
+# IDE and editor files
+.vscode/
+.idea/
+
+# Windows and OS files
+.DS_Store
+Thumbs.db
+desktop.ini
