@@ -3,6 +3,7 @@ const API_BASE_URL = 'http://127.0.0.1:8000'
 const TOKEN_KEY = 'focusflowToken'
 const EMAIL_KEY = 'focusflowEmail'
 const ACTIVITY_KEY = 'focusflowActivity'
+const METRICS_KEY = 'focusflowMetrics'
 
 const elements = {
   loginSection: document.getElementById('loginSection'),
@@ -35,28 +36,18 @@ function setConnectionStatus(online) {
 
 function getTodayKey() {
   const now = new Date()
-  const year = now.getFullYear()
-  const month = String(now.getMonth() + 1).padStart(2, '0')
-  const day = String(now.getDate()).padStart(2, '0')
-
-  return `${year}-${month}-${day}`
+  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`
 }
 
 function formatDuration(seconds) {
-  const totalSeconds = Math.max(0, Math.floor(seconds || 0))
-  const hours = Math.floor(totalSeconds / 3600)
-  const minutes = Math.floor((totalSeconds % 3600) / 60)
-  const remainingSeconds = totalSeconds % 60
+  const total = Math.max(0, Math.floor(Number(seconds) || 0))
+  const hours = Math.floor(total / 3600)
+  const minutes = Math.floor((total % 3600) / 60)
+  const remaining = total % 60
 
-  if (hours > 0) {
-    return `${hours}h ${minutes}m`
-  }
-
-  if (minutes > 0) {
-    return `${minutes}m ${remainingSeconds}s`
-  }
-
-  return `${remainingSeconds}s`
+  if (hours > 0) return `${hours}h ${minutes}m`
+  if (minutes > 0) return `${minutes}m ${remaining}s`
+  return `${remaining}s`
 }
 
 async function getLocalActivity() {
@@ -64,28 +55,28 @@ async function getLocalActivity() {
   return result[ACTIVITY_KEY] || {}
 }
 
+async function getLocalMetrics() {
+  const result = await chrome.storage.local.get(METRICS_KEY)
+  return result[METRICS_KEY] || {}
+}
+
 function renderActivity(activity) {
   const today = activity[getTodayKey()] || {}
 
   const sites = Object.entries(today)
-    .filter(([domain, entry]) => {
-      return (
-        domain &&
-        domain !== 'null' &&
-        entry &&
-        Number.isFinite(Number(entry.seconds))
-      )
-    })
+    .filter(([domain, entry]) =>
+      domain &&
+      domain !== 'null' &&
+      entry &&
+      Number.isFinite(Number(entry.seconds))
+    )
     .map(([domain, entry]) => ({
       domain,
       seconds: Math.max(0, Number(entry.seconds)),
     }))
     .sort((a, b) => b.seconds - a.seconds)
 
-  const totalSeconds = sites.reduce(
-    (total, site) => total + site.seconds,
-    0,
-  )
+  const totalSeconds = sites.reduce((sum, site) => sum + site.seconds, 0)
 
   elements.totalTime.textContent = formatDuration(totalSeconds)
   elements.siteCount.textContent =
@@ -93,7 +84,7 @@ function renderActivity(activity) {
 
   elements.activityList.replaceChildren()
 
-  if (sites.length === 0) {
+  if (!sites.length) {
     const empty = document.createElement('p')
     empty.className = 'empty-state'
     empty.textContent = 'No activity recorded today yet.'
@@ -120,22 +111,15 @@ function renderActivity(activity) {
 }
 
 async function loadActivity() {
-  const response = await chrome.runtime.sendMessage({
-    type: 'GET_ACTIVITY',
-  })
+  const response = await chrome.runtime.sendMessage({ type: 'GET_ACTIVITY' })
 
-  if (response?.error) {
-    throw new Error(response.error)
-  }
+  if (response?.error) throw new Error(response.error)
 
   renderActivity(response?.activity || {})
 }
 
 async function showLoggedInView() {
-  const stored = await chrome.storage.local.get([
-    TOKEN_KEY,
-    EMAIL_KEY,
-  ])
+  const stored = await chrome.storage.local.get([TOKEN_KEY, EMAIL_KEY])
 
   if (!stored[TOKEN_KEY]) {
     elements.loginSection.classList.remove('hidden')
@@ -157,6 +141,33 @@ async function showLoggedInView() {
   setConnectionStatus(true)
 }
 
+async function apiRequest(path, token, body) {
+  const response = await fetch(`${API_BASE_URL}${path}`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${token}`,
+    },
+    body: JSON.stringify(body),
+  })
+
+  const data = await response.json().catch(() => ({}))
+
+  if (response.status === 401 || response.status === 403) {
+    throw new Error('AUTH_EXPIRED')
+  }
+
+  if (!response.ok) {
+    const detail = Array.isArray(data.detail)
+      ? data.detail.map((item) => item.msg).join(', ')
+      : data.detail
+
+    throw new Error(detail || `Request failed (${response.status}).`)
+  }
+
+  return data
+}
+
 elements.loginForm.addEventListener('submit', async (event) => {
   event.preventDefault()
 
@@ -170,9 +181,7 @@ elements.loginForm.addEventListener('submit', async (event) => {
   try {
     const response = await fetch(`${API_BASE_URL}/api/auth/login`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
+      headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email, password }),
     })
 
@@ -187,33 +196,19 @@ elements.loginForm.addEventListener('submit', async (event) => {
     }
 
     const token = data.access_token || data.token
-
-    if (!token) {
-      throw new Error(
-        'Login response did not contain a token. Check the backend login response format.',
-      )
-    }
-
-    const accountEmail =
-      data.user?.email ||
-      data.email ||
-      email
+    if (!token) throw new Error('The login response did not contain a token.')
 
     await chrome.storage.local.set({
       [TOKEN_KEY]: token,
-      [EMAIL_KEY]: accountEmail,
+      [EMAIL_KEY]: data.user?.email || data.email || email,
     })
 
     elements.password.value = ''
-
     await showLoggedInView()
     showStatus('Successfully logged in.', 'success')
   } catch (error) {
     setConnectionStatus(false)
-    showStatus(
-      error.message || 'Could not connect to the FocusFlow backend.',
-      'error',
-    )
+    showStatus(error.message || 'Could not connect to FocusFlow.', 'error')
   } finally {
     elements.loginButton.disabled = false
     elements.loginButton.textContent = 'Log in'
@@ -232,16 +227,17 @@ elements.refreshButton.addEventListener('click', async () => {
 elements.syncButton.addEventListener('click', async () => {
   elements.syncButton.disabled = true
   elements.syncButton.textContent = 'Syncing...'
-  showStatus('Syncing website activity...')
+  showStatus('Syncing website activity and tracking metrics...')
+
+  let websiteSynced = false
 
   try {
     const stored = await chrome.storage.local.get(TOKEN_KEY)
     const token = stored[TOKEN_KEY]
 
-    if (!token) {
-      throw new Error('Please log in before syncing activity.')
-    }
+    if (!token) throw new Error('Please log in before syncing.')
 
+    // 1. Preserve the existing website activity sync.
     const activity = await getLocalActivity()
     const entries = []
 
@@ -252,9 +248,7 @@ elements.syncButton.addEventListener('click', async () => {
           domain === 'null' ||
           !details ||
           !Number.isFinite(Number(details.seconds))
-        ) {
-          continue
-        }
+        ) continue
 
         entries.push({
           date,
@@ -271,47 +265,70 @@ elements.syncButton.addEventListener('click', async () => {
       }
     }
 
-    if (entries.length === 0) {
-      showStatus('There is no website activity to sync yet.', 'error')
-      return
+    if (entries.length) {
+      const result = await apiRequest('/api/activity/sync', token, { entries })
+      websiteSynced = true
+      showStatus(
+        `Website activity synced (${result.saved ?? entries.length} records). Syncing metrics...`
+      )
+    } else {
+      websiteSynced = true
     }
 
-    const response = await fetch(`${API_BASE_URL}/api/activity/sync`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({ entries }),
-    })
+    // 2. Sync the metrics collected by background.js.
+    const metricsByDate = await getLocalMetrics()
+    const metrics = Object.entries(metricsByDate)
+      .filter(([date, value]) =>
+        /^\d{4}-\d{2}-\d{2}$/.test(date) && value
+      )
+      .map(([date, value]) => ({
+        date,
+        tab_switches: Math.max(0, Math.floor(Number(value.tab_switches) || 0)),
+        active_seconds: Math.max(0, Math.floor(Number(value.active_seconds) || 0)),
+        idle_seconds: Math.max(0, Math.floor(Number(value.idle_seconds) || 0)),
+      }))
 
-    const data = await response.json().catch(() => ({}))
+    if (metrics.length) {
+      // This endpoint must be implemented in FastAPI in the next step.
+      const result = await apiRequest(
+        '/api/v1/analytics/metrics/sync',
+        token,
+        { metrics }
+      )
 
-    if (response.status === 401 || response.status === 403) {
-      await chrome.storage.local.remove([TOKEN_KEY, EMAIL_KEY])
-      setConnectionStatus(false)
-      await showLoggedInView()
-      throw new Error('Your login has expired. Please log in again.')
+      const now = new Date().toLocaleTimeString()
+      elements.lastSync.textContent = `Last synced: ${now}`
+      setConnectionStatus(true)
+
+      showStatus(
+        `Sync successful. ${entries.length} website records and ${result.saved ?? metrics.length} metric records synced.`,
+        'success'
+      )
+    } else {
+      const now = new Date().toLocaleTimeString()
+      elements.lastSync.textContent = `Last synced: ${now}`
+      setConnectionStatus(true)
+
+      showStatus(
+        websiteSynced
+          ? 'Website activity synced. No tracking metrics recorded yet.'
+          : 'There is no activity to sync yet.',
+        websiteSynced ? 'success' : 'error'
+      )
     }
-
-    if (!response.ok) {
-      const detail = Array.isArray(data.detail)
-        ? data.detail.map((item) => item.msg).join(', ')
-        : data.detail
-
-      throw new Error(detail || `Sync failed (${response.status}).`)
-    }
-
-    const now = new Date().toLocaleTimeString()
-    elements.lastSync.textContent = `Last synced: ${now}`
-    setConnectionStatus(true)
-
-    showStatus(
-      `Sync successful. ${data.saved ?? entries.length} activity records saved.`,
-      'success',
-    )
   } catch (error) {
-    showStatus(error.message || 'Could not sync activity.', 'error')
+    if (error.message === 'AUTH_EXPIRED') {
+      await chrome.storage.local.remove([TOKEN_KEY, EMAIL_KEY])
+      await showLoggedInView()
+      showStatus('Your login has expired. Please log in again.', 'error')
+    } else {
+      showStatus(
+        websiteSynced
+          ? `Website activity synced, but metrics sync failed: ${error.message}.`
+          : error.message || 'Could not sync activity.',
+        'error'
+      )
+    }
   } finally {
     elements.syncButton.disabled = false
     elements.syncButton.textContent = 'Sync activity'

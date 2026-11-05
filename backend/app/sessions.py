@@ -1,5 +1,6 @@
 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from uuid import uuid4
 import os
 
@@ -27,9 +28,24 @@ bearer_scheme = HTTPBearer(auto_error=False)
 JWT_SECRET = os.getenv("JWT_SECRET")
 JWT_ALGORITHM = "HS256"
 
+IST = ZoneInfo("Asia/Kolkata")
+
 
 def now_utc():
+    """Return the current timezone-aware UTC datetime."""
     return datetime.now(timezone.utc)
+
+
+def to_ist_string(value):
+    """Convert a datetime into an ISO-formatted IST string."""
+    if value is None:
+        return None
+
+    # PyMongo may return naive datetimes representing UTC.
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+
+    return value.astimezone(IST).isoformat()
 
 
 def ensure_utc(value):
@@ -94,20 +110,42 @@ def get_current_user(
 
 
 class StartSessionRequest(BaseModel):
-    goal_minutes: int = Field(default=25, ge=1, le=180)
+    goal_minutes: int = Field(default=20, ge=1, le=180)
 
 
 def session_response(session):
-    """Return session data without exposing MongoDB internal fields."""
+    """Return session data with original timestamps and IST strings."""
+
+    started_at = session.get("started_at")
+    ended_at = session.get("ended_at")
+    created_at = session.get("created_at")
+
     return {
         "id": session["session_id"],
         "user_id": session["user_id"],
         "goal_minutes": session["goal_minutes"],
         "status": session["status"],
-        "started_at": session["started_at"],
-        "ended_at": session.get("ended_at"),
+
+        # Original MongoDB datetime fields
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "created_at": created_at,
+
+        # Readable IST representations
+        "started_at_ist": (
+            session.get("started_at_ist")
+            or to_ist_string(started_at)
+        ),
+        "ended_at_ist": (
+            session.get("ended_at_ist")
+            or to_ist_string(ended_at)
+        ),
+        "created_at_ist": (
+            session.get("created_at_ist")
+            or to_ist_string(created_at)
+        ),
+
         "total_seconds": session.get("total_seconds", 0),
-        "created_at": session["created_at"],
     }
 
 
@@ -115,7 +153,11 @@ def calculate_elapsed_seconds(started_at):
     """Calculate non-negative elapsed seconds from a start timestamp."""
     return max(
         0,
-        int((now_utc() - ensure_utc(started_at)).total_seconds()),
+        int(
+            (
+                now_utc() - ensure_utc(started_at)
+            ).total_seconds()
+        ),
     )
 
 
@@ -125,7 +167,10 @@ def capped_total_seconds(session, additional_seconds=0):
 
     return min(
         goal_seconds,
-        max(0, session.get("total_seconds", 0) + additional_seconds),
+        max(
+            0,
+            session.get("total_seconds", 0) + additional_seconds,
+        ),
     )
 
 
@@ -148,17 +193,27 @@ def start_session(
         )
 
     timestamp = now_utc()
+    timestamp_ist = to_ist_string(timestamp)
 
     session = {
         "session_id": str(uuid4()),
         "user_id": user_id,
         "goal_minutes": payload.goal_minutes,
         "status": "running",
+
         "started_at": timestamp,
+        "started_at_ist": timestamp_ist,
+
         "ended_at": None,
+        "ended_at_ist": None,
+
         "total_seconds": 0,
+
         "running_since": timestamp,
+        "running_since_ist": timestamp_ist,
+
         "created_at": timestamp,
+        "created_at_ist": timestamp_ist,
     }
 
     sessions_collection.insert_one(session)
@@ -188,7 +243,10 @@ def pause_session(
     elapsed = calculate_elapsed_seconds(session["running_since"])
     total_seconds = capped_total_seconds(session, elapsed)
     timestamp = now_utc()
-    completed = total_seconds >= session["goal_minutes"] * 60
+
+    completed = (
+        total_seconds >= session["goal_minutes"] * 60
+    )
 
     sessions_collection.update_one(
         {
@@ -200,8 +258,14 @@ def pause_session(
             "$set": {
                 "total_seconds": total_seconds,
                 "status": "completed" if completed else "paused",
+
                 "running_since": None,
+                "running_since_ist": None,
+
                 "ended_at": timestamp if completed else None,
+                "ended_at_ist": (
+                    to_ist_string(timestamp) if completed else None
+                ),
             }
         },
     )
@@ -233,7 +297,10 @@ def resume_session(
             detail="Paused session not found.",
         )
 
-    if session.get("total_seconds", 0) >= session["goal_minutes"] * 60:
+    if (
+        session.get("total_seconds", 0)
+        >= session["goal_minutes"] * 60
+    ):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail="The session goal has already been reached.",
@@ -251,6 +318,7 @@ def resume_session(
             "$set": {
                 "status": "running",
                 "running_since": timestamp,
+                "running_since_ist": to_ist_string(timestamp),
             }
         },
     )
@@ -289,7 +357,11 @@ def end_session(
             session["running_since"]
         )
 
-    total_seconds = capped_total_seconds(session, extra_seconds)
+    total_seconds = capped_total_seconds(
+        session,
+        extra_seconds,
+    )
+
     timestamp = now_utc()
 
     sessions_collection.update_one(
@@ -302,8 +374,12 @@ def end_session(
             "$set": {
                 "total_seconds": total_seconds,
                 "status": "completed",
+
                 "ended_at": timestamp,
+                "ended_at_ist": to_ist_string(timestamp),
+
                 "running_since": None,
+                "running_since_ist": None,
             }
         },
     )
