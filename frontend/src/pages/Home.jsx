@@ -4,7 +4,7 @@ import {
   Brain, Clock3, Target, Play, Pause, RotateCcw, LogOut,
   Flame, TrendingUp, CalendarDays, CheckCircle2, History,
   RefreshCw, Globe, LayoutDashboard, Menu, Settings as SettingsIcon, Lightbulb,
-  Coffee, SkipForward,
+  Coffee, SkipForward, ListChecks,
 } from 'lucide-react'
 import {
   ResponsiveContainer, BarChart, Bar, LineChart, Line,
@@ -968,6 +968,18 @@ export default function Home() {
             >
               <Lightbulb size={18} />
               Recommendations
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setMobileNavOpen(false)
+                navigate('/habits')
+              }}
+              className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-medium text-slate-600 transition hover:bg-orange-50 hover:text-orange-700"
+            >
+              <ListChecks size={18} />
+              Habit tracking
             </button>
 
             <button

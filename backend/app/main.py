@@ -11,6 +11,7 @@ from app.profile import router as profile_router
 from app.analytics import router as analytics_router
 from app.recommendations import router as recommendations_router
 from app.breaks import router as breaks_router
+from app.habits import router as habits_router
 
 
 @asynccontextmanager
@@ -70,3 +71,4 @@ app.include_router(profile_router)
 app.include_router(analytics_router)
 app.include_router(recommendations_router)
 app.include_router(breaks_router)
+app.include_router(habits_router)
