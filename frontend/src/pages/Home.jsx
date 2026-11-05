@@ -986,6 +986,18 @@ export default function Home() {
               type="button"
               onClick={() => {
                 setMobileNavOpen(false)
+                navigate('/weekly-focus')
+              }}
+              className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-medium text-slate-600 transition hover:bg-orange-50 hover:text-orange-700"
+            >
+              <CalendarDays size={18} />
+              Weekly focus
+            </button>
+
+            <button
+              type="button"
+              onClick={() => {
+                setMobileNavOpen(false)
                 navigate('/settings')
               }}
               className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-sm font-medium text-slate-600 transition hover:bg-slate-50 hover:text-slate-900"

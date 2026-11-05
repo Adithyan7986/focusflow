@@ -5,6 +5,7 @@ import Home from './pages/Home'
 import Settings from './pages/Settings'
 import Recommendations from './pages/Recommendations'
 import HabitTracking from './pages/HabitTracking'
+import WeeklyFocus from './pages/WeeklyFocus'
 
 function App() {
   return (
@@ -16,6 +17,7 @@ function App() {
         <Route path="/settings" element={<Settings />} />
         <Route path="/recommendations" element={<Recommendations />} />
         <Route path="/habits" element={<HabitTracking />} />
+        <Route path="/weekly-focus" element={<WeeklyFocus />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </HashRouter>

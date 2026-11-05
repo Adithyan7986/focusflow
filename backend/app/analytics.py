@@ -1,11 +1,12 @@
 
 from datetime import date, datetime, time, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from app.database import activity_collection, sessions_collection, database
+from app.database import activity_collection, sessions_collection, database, users_collection
 from app.sessions import get_current_user
 from app.ml_models import load_models
 
@@ -127,6 +128,93 @@ def get_daily_data(user_id: str, selected_date: date):
             if item.get("status") == "completed"
         ),
         "website_count": len(activity),
+    }
+
+
+# ---------------------------------------------------------
+# WEEKLY FOCUS DASHBOARD
+# ---------------------------------------------------------
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def _as_utc(value: datetime) -> datetime:
+    """Treat naive MongoDB datetimes as UTC and return an aware UTC value."""
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+@router.get("/weekly-focus")
+def weekly_focus(
+    user_id: str = Depends(get_current_user),
+):
+    """Return Monday-Sunday focus statistics for the current IST week."""
+    now_ist = datetime.now(IST)
+    today_ist = now_ist.date()
+    week_start = today_ist - timedelta(days=today_ist.weekday())
+    next_week_start = week_start + timedelta(days=7)
+
+    # MongoDB stores session timestamps in UTC. Convert IST boundaries to UTC
+    # before querying so sessions around midnight are assigned correctly.
+    start_utc = datetime.combine(week_start, time.min, tzinfo=IST).astimezone(timezone.utc)
+    end_utc = datetime.combine(next_week_start, time.min, tzinfo=IST).astimezone(timezone.utc)
+    now_utc = datetime.now(timezone.utc)
+
+    records = list(sessions_collection.find({
+        "user_id": user_id,
+        "started_at": {"$gte": start_utc, "$lt": end_utc},
+    }, {"_id": 0}))
+
+    daily = []
+    for offset in range(7):
+        day = week_start + timedelta(days=offset)
+        day_start = datetime.combine(day, time.min, tzinfo=IST).astimezone(timezone.utc)
+        day_end = datetime.combine(day + timedelta(days=1), time.min, tzinfo=IST).astimezone(timezone.utc)
+        day_records = [
+            item for item in records
+            if item.get("started_at") is not None
+            and day_start <= _as_utc(item["started_at"]) < day_end
+        ]
+
+        focus_seconds = 0
+        for item in day_records:
+            seconds = max(0, int(item.get("total_seconds", 0) or 0))
+            if item.get("status") == "running" and item.get("running_since"):
+                seconds += max(0, int((now_utc - _as_utc(item["running_since"])).total_seconds()))
+            focus_seconds += seconds
+
+        daily.append({
+            "date": day.isoformat(),
+            "day": day.strftime("%a"),
+            "focus_seconds": focus_seconds,
+            "focus_minutes": round(focus_seconds / 60, 2),
+            "sessions": len(day_records),
+            "completed_sessions": sum(1 for item in day_records if item.get("status") == "completed"),
+        })
+
+    total_seconds = sum(item["focus_seconds"] for item in daily)
+    completed_sessions = sum(item["completed_sessions"] for item in daily)
+    # Respect the user's saved daily goal when available; otherwise use the
+    # same 120-minute default used by the dashboard.
+    profile = users_collection.find_one({"user_id": user_id}, {"daily_goal_minutes": 1}) or {}
+    daily_goal_minutes = int(profile.get("daily_goal_minutes", 120) or 120)
+    weekly_goal_minutes = daily_goal_minutes * 7
+
+    return {
+        "week_start": week_start.isoformat(),
+        "week_end": (next_week_start - timedelta(days=1)).isoformat(),
+        "timezone": "Asia/Kolkata",
+        "today": today_ist.isoformat(),
+        "total_focus_seconds": total_seconds,
+        "total_focus_minutes": round(total_seconds / 60, 2),
+        "completed_sessions": completed_sessions,
+        "total_sessions": sum(item["sessions"] for item in daily),
+        "average_daily_focus_minutes": round(total_seconds / 60 / 7, 2),
+        "daily_goal_minutes": daily_goal_minutes,
+        "weekly_goal_minutes": weekly_goal_minutes,
+        "weekly_goal_progress": round((total_seconds / 60 / weekly_goal_minutes) * 100, 1) if weekly_goal_minutes else 0,
+        "daily": daily,
     }
 
 
