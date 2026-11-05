@@ -6,6 +6,7 @@ import Settings from './pages/Settings'
 import Recommendations from './pages/Recommendations'
 import HabitTracking from './pages/HabitTracking'
 import WeeklyFocus from './pages/WeeklyFocus'
+import AdminDashboard from './pages/AdminDashboard'
 
 function App() {
   return (
@@ -18,6 +19,7 @@ function App() {
         <Route path="/recommendations" element={<Recommendations />} />
         <Route path="/habits" element={<HabitTracking />} />
         <Route path="/weekly-focus" element={<WeeklyFocus />} />
+        <Route path="/admin" element={<AdminDashboard />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </HashRouter>
